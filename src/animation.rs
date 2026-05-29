@@ -1,4 +1,16 @@
+//! 虫子动画引擎 — 屏幕覆盖模式
+//!
+//! 虫子是"漂浮在屏幕上"的视觉特效。覆盖文字时：
+//!   1. 从 ScreenBuffer 保存原始字符
+//!   2. 在终端上绘制虫子 Emoji
+//! 虫子移走/消失时：
+//!   1. 从 ScreenBuffer 恢复原始字符
+//!   2. 写回终端
+
+use crate::screen::ScreenBuffer;
 use crate::terminal::Terminal;
+
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 /// 虫子 Emoji 池
@@ -13,49 +25,40 @@ pub struct Bug {
     pub birth: Instant,
     pub direction: i8, // -1: 向左, 1: 向右
     pub lifetime: Duration,
+    /// 虫子在当前位置覆盖的原始字符（用于恢复）
+    pub saved_char: Option<char>,
 }
 
-/// 虫子管理器（全局状态，线程安全）
+/// 虫子管理器
 pub struct BugManager {
     bugs: Vec<Bug>,
     max_concurrent: usize,
-    cols: u16,
-    rows: u16,
 }
 
 impl BugManager {
-    pub fn new(max_concurrent: usize, cols: u16, rows: u16) -> Self {
+    pub fn new(max_concurrent: usize, _cols: u16, _rows: u16) -> Self {
         Self {
             bugs: Vec::new(),
             max_concurrent,
-            cols,
-            rows,
         }
-    }
-
-    /// 更新终端尺寸
-    pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.cols = cols;
-        self.rows = rows;
-        // 移出超出边界的虫子
-        self.bugs.retain(|b| b.x < cols && b.y < rows);
     }
 
     /// 触发一波虫子（根据匹配次数）
-    pub fn trigger(&mut self, match_count: usize, lifetime: Duration) {
+    pub fn trigger(&mut self, match_count: usize, lifetime: Duration, screen: &ScreenBuffer) {
         if match_count == 0 {
             return;
         }
-        // 计算本次要生成的虫子数量（每次匹配随机 2~5 只）
         let available = self.max_concurrent.saturating_sub(self.bugs.len());
         if available == 0 {
             return;
         }
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let cols = screen.cols();
+        let rows = screen.rows();
+        if cols == 0 || rows == 0 {
+            return;
+        }
+
+        let seed = Instant::now().elapsed().as_nanos() as u64;
         let mut rng = SimpleRng::new(seed);
 
         let mut to_spawn = 0;
@@ -66,12 +69,12 @@ impl BugManager {
         let to_spawn = to_spawn.min(available);
 
         for _ in 0..to_spawn {
-            // 随机位置：行在视口上半区 (0 ~ rows/2)
-            let y = (rng.next() % (self.rows / 2).max(1) as u64) as u16;
-            let x = (rng.next() % self.cols.max(1) as u64) as u16;
+            let y = (rng.next() % (rows / 2).max(1) as u64) as u16;
+            let x = (rng.next() % cols.max(1) as u64) as u16;
             let emoji_idx = (rng.next() % BUG_EMOJIS.len() as u64) as usize;
             let direction = if rng.next() % 2 == 0 { 1 } else { -1 };
 
+            // 不要立即保存字符——等 draw_to 时再保存（此时才真正覆盖）
             self.bugs.push(Bug {
                 x,
                 y,
@@ -79,16 +82,31 @@ impl BugManager {
                 birth: Instant::now(),
                 direction,
                 lifetime,
+                saved_char: None,
             });
         }
     }
 
     /// 更新虫子位置 & 移除超时虫子
-    pub fn update(&mut self) {
+    ///
+    /// 返回 [(x, y, original_char)] 需恢复的位置列表
+    pub fn update<W: Write>(
+        &mut self,
+        _dev: &mut W,
+        screen: &mut ScreenBuffer,
+    ) -> std::io::Result<Vec<(u16, u16, char)>> {
         let now = Instant::now();
-        // 先清除所有虫子的旧位置
+        let mut to_restore = Vec::new();
+
+        let cols = screen.cols();
+        let rows = screen.rows();
+
+        // 第一步：恢复所有移走的虫子的原始字符
         for bug in &self.bugs {
-            let _ = Terminal::clear_at(bug.x, bug.y);
+            if let Some(_saved) = bug.saved_char {
+                // 虫子还活着但需要恢复旧位置——在位置更新前做
+                // 但我们还不知道新位置，所以先收集旧的
+            }
         }
 
         // 更新位置、移除超时虫子
@@ -98,73 +116,96 @@ impl BugManager {
         });
 
         for bug in &mut self.bugs {
-            // 水平漂移 1~2 列
-            let drift = if bug.direction > 0 { 1 } else { 1 }; // 向右或向左
-            let dx = drift;
-            let new_x = bug.x as i32 + dx * bug.direction as i32;
-            if new_x >= 0 && new_x < self.cols as i32 {
-                bug.x = new_x as u16;
-            } else {
-                // 碰壁反弹
-                bug.direction = -bug.direction;
-                let new_x = bug.x as i32 + bug.direction as i32;
-                if new_x >= 0 && new_x < self.cols as i32 {
-                    bug.x = new_x as u16;
-                }
+            // 如果虫子之前有保存的字符，先恢复
+            if let Some(saved) = bug.saved_char.take() {
+                to_restore.push((bug.x, bug.y, saved));
+                // 同时告诉 screen 这个位置不再被虫子持有
+                screen.restore_char(bug.x, bug.y);
             }
 
-            // 随机上下浮动 0~1 行
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let seed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
+            // 水平移动
+            let new_x = bug.x as i32 + bug.direction as i32;
+            if new_x >= 0 && new_x < cols as i32 {
+                bug.x = new_x as u16;
+            } else {
+                bug.direction = -bug.direction;
+            }
+
+            // 随机上下浮动
+            let seed = now.elapsed().as_nanos() as u64;
             let mut rng = SimpleRng::new(seed.wrapping_add(bug.x as u64));
-            let dy = (rng.next() % 2) as i16; // 0 或 1
-            // 随机向上或向下
-            let dy = if rng.next() % 2 == 0 { dy } else { -dy };
+            let dy = if rng.next() % 2 == 0 { 1i16 } else { -1i16 };
             let new_y = bug.y as i16 + dy;
-            if new_y >= 0 && new_y < self.rows as i16 {
+            if new_y >= 0 && new_y < rows as i16 {
                 bug.y = new_y as u16;
             }
         }
+
+        Ok(to_restore)
     }
 
-    /// 绘制所有虫子
-    pub fn draw(&self) {
-        for bug in &self.bugs {
-            let _ = Terminal::draw_bug(bug.x, bug.y, bug.emoji);
+    /// 绘制所有虫子（先保存再覆盖）
+    pub fn draw_to<W: Write>(
+        &mut self,
+        dev: &mut W,
+        screen: &mut ScreenBuffer,
+    ) -> std::io::Result<()> {
+        for bug in &mut self.bugs {
+            // 保存当前位置的原始字符
+            let ch = screen.save_char(bug.x, bug.y);
+            bug.saved_char = Some(ch);
+            // 绘制虫子 Emoji 覆盖
+            Terminal::draw_bug_to(dev, bug.x, bug.y, bug.emoji)?;
         }
-        let _ = Terminal::flush();
+        Ok(())
     }
 
-    /// 清除所有虫子
-    pub fn clear_all(&mut self) {
+    /// 恢复所有虫子的原始字符（退出时调用）
+    pub fn clear_all<W: Write>(
+        &mut self,
+        dev: &mut W,
+        screen: &mut ScreenBuffer,
+    ) -> std::io::Result<()> {
         for bug in self.bugs.drain(..) {
-            let _ = Terminal::clear_at(bug.x, bug.y);
+            if let Some(ch) = bug.saved_char {
+                // 写回原始字符
+                Terminal::clear_at_to(dev, bug.x, bug.y, ch)?;
+                screen.restore_char(bug.x, bug.y);
+            }
         }
-        let _ = Terminal::flush();
+        Ok(())
     }
 
-    /// 获取当前虫子数量
-    #[allow(dead_code)]
-    pub fn count(&self) -> usize {
-        self.bugs.len()
+    /// 恢复指定位置的字符
+    pub fn restore_positions<W: Write>(
+        &self,
+        dev: &mut W,
+        positions: &[(u16, u16, char)],
+    ) -> std::io::Result<()> {
+        for &(x, y, ch) in positions {
+            Terminal::clear_at_to(dev, x, y, ch)?;
+        }
+        Ok(())
     }
 }
 
-/// 简单的伪随机数生成器（线性同余）
+/// 简单的伪随机数生成器
 struct SimpleRng {
     state: u64,
 }
 
 impl SimpleRng {
     fn new(seed: u64) -> Self {
-        Self { state: if seed == 0 { 1 } else { seed } }
+        Self {
+            state: if seed == 0 { 1 } else { seed },
+        }
     }
 
     fn next(&mut self) -> u64 {
-        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.state >> 33
     }
 }

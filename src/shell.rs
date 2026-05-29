@@ -1,3 +1,8 @@
+//! PTY Shell 进程管理器
+//!
+//! 创建 PTY 伪终端对，在 slave 端启动用户的默认 Shell（bash/zsh/fish），
+//! 通过 master fd 读写 Shell I/O。所有 shell 配置正常加载。
+
 use anyhow::{Context, Result};
 use nix::fcntl::OFlag;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt};
@@ -11,8 +16,6 @@ use std::sync::mpsc;
 use std::thread;
 
 /// 检测用户的默认 shell
-///
-/// 返回值: (shell 路径, shell 名称, 启动参数)
 fn detect_shell() -> (String, String, Vec<String>) {
     let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let shell_name = Path::new(&shell_path)
@@ -21,28 +24,19 @@ fn detect_shell() -> (String, String, Vec<String>) {
         .unwrap_or("bash")
         .to_string();
 
+    // 所有 Shell 正常加载配置（不传限制性参数）
     let args: Vec<String> = match shell_name.as_str() {
-        // bash: 不加载 .bashrc，提供干净环境（用户可在 shell 内 source）
-        "bash" => vec![],
-        // zsh: 也不加载 .zshrc
-        "zsh" => vec!["-f".into()],          // -f = --no-rcs
-        // fish: --no-config 跳过所有配置文件
-        "fish" => vec!["--no-config".into()],
-        // 其他 shell: 无特殊参数
         _ => vec![],
     };
 
     (shell_path, shell_name, args)
 }
 
-/// Shell 进程管理器 — 基于 PTY（伪终端）实现
-///
-/// 自动适配用户默认 shell（bash / fish / zsh 等），
-/// 通过 PTY 驱动提供完整的终端回显、提示符、任务控制。
+/// Shell 进程管理器
 pub struct Shell {
-    pub shell_name: String,             // 标识当前 shell，供外部逻辑参考
-    master: File,                       // PTY master — 读写 shell 数据
-    child: Child,                       // 子进程句柄
+    pub shell_name: String,
+    master: File,
+    child: Child,
     output_rx: mpsc::Receiver<Vec<u8>>,
 }
 
@@ -51,7 +45,7 @@ impl Shell {
     pub fn spawn() -> Result<Self> {
         let (shell_path, shell_name, shell_args) = detect_shell();
 
-        // ── 1. 打开 PTY master/slave 对 ──
+        // ── 1. 打开 PTY master/slave ──
         let master_fd = posix_openpt(OFlag::O_RDWR | OFlag::O_CLOEXEC)
             .context("posix_openpt")?;
         grantpt(&master_fd).context("grantpt")?;
@@ -92,27 +86,17 @@ impl Shell {
                 .pre_exec(|| {
                     let fd = libc::STDIN_FILENO;
 
-                    // ① 成为 session leader
+                    // 成为 session leader
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
 
-                    // ② 将 PTY slave 设为此 session 的控制终端
+                    // 将 PTY slave 设为此 session 的控制终端
                     if libc::ioctl(fd, libc::TIOCSCTTY, 0) < 0 {
                         let err = std::io::Error::last_os_error();
                         if err.raw_os_error() != Some(libc::EINVAL) {
                             return Err(err);
                         }
-                    }
-
-                    // ③ 设置 raw 模式
-                    let mut termios: libc::termios = std::mem::zeroed();
-                    if libc::tcgetattr(fd, &mut termios) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    libc::cfmakeraw(&mut termios);
-                    if libc::tcsetattr(fd, libc::TCSAFLUSH, &termios) < 0 {
-                        return Err(std::io::Error::last_os_error());
                     }
 
                     Ok(())
@@ -147,7 +131,7 @@ impl Shell {
         })
     }
 
-    /// 设置 PTY 的终端尺寸（行列数）
+    /// 设置 PTY 的终端尺寸
     pub fn set_window_size(&self, cols: u16, rows: u16) -> Result<()> {
         let ws = libc::winsize {
             ws_row: rows,
@@ -180,11 +164,5 @@ impl Shell {
             Ok(None) => true,
             _ => false,
         }
-    }
-
-    /// 等待 shell 子进程退出
-    #[allow(dead_code)]
-    pub fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        Ok(self.child.wait()?)
     }
 }
