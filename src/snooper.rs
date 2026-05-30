@@ -26,6 +26,18 @@ fn pid_path() -> Result<PathBuf> {
     Ok(state_dir()?.join(PID_FILE))
 }
 
+/// 启动测试模式（前台阻塞）
+/// 包装当前终端，输出 10 组随机位置的 ScreenBuffer 字符到 stderr。
+pub fn start_test_snooper() -> Result<()> {
+    let my_pid = std::process::id();
+    eprintln!("🐛 oh-bugs! 测试模式已启动 (PID {my_pid})");
+    eprintln!("   不触发虫子，仅输出随机位置的 ScreenBuffer 字符");
+    eprintln!();
+
+    let result = crate::daemon::run_test();
+    result
+}
+
 /// 启动嗅探器（前台，PTY 包装当前终端）
 pub fn start_snooper() -> Result<()> {
     let pid_path = pid_path()?;

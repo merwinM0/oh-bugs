@@ -44,21 +44,21 @@ obugs --off
 
 ```
 步骤 1: Shell 输出 "Error: not found"
-         → 屏幕缓冲区的二维 Cell 网格记录每个位置的字符
+         → ScreenBuffer 记录每个位置的字符
          → 转发到真实终端显示
 
 步骤 2: 检测到 "error" → 触发虫子
-         → ScreenBuffer.save_bug(x, y, id, emoji) 标记 (x,y) 和 (x+1,y)
-         → Cell.original_char 保留原字符，Cell.bug_id 记录虫子 ID
+         → SavedCell::capture(screen, x, y) 读取 ScreenBuffer
+         → 存入虫子自身的 saved_left / saved_right（备份）
          → 在 (x, y) 处绘制 2 列宽的虫子 Emoji 🐝
 
 步骤 3: 虫子飞走
-         → ScreenBuffer.restore_bug(old_x, old_y, id)
-         → 从 Cell.original_char 恢复两个单元格
-         → 写回终端：位置 (x,y) 和 (x+1,y) 原样恢复
+         → 从 saved_left.character 取出备份字符
+         → Terminal::clear_at_to() 写回终端
+         → 位置 (x,y) 和 (x+1,y) 原样恢复
 
 步骤 4: 虫子消失
-         → 所有被覆盖位置全部恢复原文字
+         → 所有虫子用自己体内的备份恢复原文字
 ```
 
 **结果：** 用户看到虫子飞过时压住了文字，飞走后文字完好如初。整个过程中终端内容没有被修改。
@@ -74,8 +74,8 @@ oh-bugs 主循环
 ├── [跟踪] PTY 输出 → 同步更新 ScreenBuffer (字符网格)
 ├── [回显剥离] PTY 输出 → 剥离匹配的输入回显前缀 → 非回显数据
 ├── [嗅探] 仅扫描非回显数据 → 匹配 error 关键字
-├── [覆盖] 触发虫子 → 从 ScreenBuffer 保存字符 → 绘制 Emoji
-└── [恢复] 虫子移动/消失 → 从 ScreenBuffer 取出字符 → 写回终端
+├── [覆盖] 触发虫子 → 从 ScreenBuffer 读取字符 → 存入虫子自身的 saved_* → 绘制 Emoji
+└── [恢复] 虫子移动/消失 → 从自身的 saved_* 取出字符 → 写回终端（始终用备份，不读 ScreenBuffer）
      ↕ PTY master
 Linux PTY Driver
      ↕ PTY slave
@@ -122,9 +122,8 @@ PTY 输出解析（同前）：
 | UTF-8 多字节字符      | 完整解码后写入                                    |
 | 颜色/SGR 序列         | 忽略（不影响字符位置）                            |
 
-> **设计要点：** 旧版使用 `HashMap<(u16,u16), char>` 独立保存被覆盖的字符；
-> 新版通过 `Cell.bug_id` 直接在二维网格中标记虫子占用，`Cell.original_char` 始终保留终端原文，
-> 无需外部 HashMap，数据一致性更好。
+> **设计要点：** 每只虫子通过 `saved_left` / `saved_right` 自己记住自己覆盖了什么内容。
+> ScreenBuffer 只追踪 PTY 输出的终端字符，不感知虫子，完全解耦。
 
 ## 4. 虫子动画规则
 
@@ -134,14 +133,16 @@ PTY 输出解析（同前）：
 | 覆盖宽度    | 每只虫子覆盖 (x, y) 和 (x+1, y) 两个单元格                           |
 | 触发条件    | 每匹配到 1 个 "error" 关键字（仅检测输出，输入回显已自动剥离）        |
 | 数量        | 每次触发随机生成 2~5 只                                               |
-| 出现位置    | 终端上半区的随机位置，x ∈ [0, cols-2] 确保 2 列宽度合法              |
+| 出现位置    | 终端上半区的随机位置，x ∈ [0, cols-2]；位置去重，避免两虫重叠        |
 | 移动方式    | 水平/垂直各独立方向（direction_x/direction_y）：60% 继续 / 30% 停留 / 10% 反向 |
-| 轨迹标识    | 每虫独立 `id`（与 Cell.bug_id 关联）+随机 `phase`，确保轨迹互不重叠    |
-| 状态追踪    | `placed: bool` 标记 emoji 是否已写入网格，避免重复/遗漏操作          |
+| 轨迹标识    | 每虫独立 `id` + 随机 `phase`，确保轨迹互不重叠                        |
+| 保存策略    | 触发时 `SavedCell::capture()` 读取 ScreenBuffer 存入虫子自身 `saved_*` |
+| 恢复策略    | 移动/死亡时始终用 `saved_*.character`（触发时刻备份），不读 ScreenBuffer |
+| 光标保护    | 所有终端写入用 `\x1b[s`…`\x1b[u` 包裹，不改变光标位置                |
 | 生命周期    | 每只虫子独立随机 2~3 秒（基于配置中心值 ±500ms），到期自动消失并恢复文字 |
 | 最大并发    | 屏幕同时最多显示 30 只虫子                                            |
 | 边缘处理    | 距边缘 <3 列时强制向中心方向走，避免堆积在屏幕边缘                  |
-| 消失恢复    | 超时后无条件恢复两个单元格的原始字符（不因空字符跳过），不会残留      |
+| 消失恢复    | 超时后无条件恢复两个单元格的备份字符，不会残留                        |
 
 ## 5. 模块设计
 
@@ -202,6 +203,7 @@ BugManager.clear_all()
 > 移动时把 saved_* 恢复到旧位置，再保存新位置的内容；
 > 死亡时把 saved_* 恢复到当前位置。
 > ScreenBuffer 只追踪终端字符，不感知虫子，完全解耦。
+> 所有终端写入（画 emoji / 恢复字符）均用 `\x1b[s`…`\x1b[u` 包裹，光标位置不受影响。
 
 ## 6. 技术选型
 

@@ -11,6 +11,7 @@
 //! | `obugs --on`      | 启动嗅探器（前台，包装当前终端）       |
 //! | `obugs --off`     | 停止嗅探器（从另一终端执行）           |
 //! | `obugs --status`  | 查看运行状态                           |
+//! | `obugs --test`    | 测试模式（不写终端，只输出调试信息）   |
 //! | `obugs --help`    | 显示帮助信息                           |
 
 mod animation;
@@ -47,6 +48,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "--test" | "test" | "-t" => {
+            if let Err(e) = snooper::start_test_snooper() {
+                eprintln!("⚠️  测试退出: {e}");
+                std::process::exit(1);
+            }
+        }
         "--help" | "help" | "-h" | "" => {
             print_help();
         }
@@ -73,12 +80,18 @@ fn print_help() {
   obugs --on       启动嗅探器（当前终端直接使用）
   obugs --off      停止嗅探器（从另一个终端执行）
   obugs --status   查看嗅探器运行状态
+  obugs --test     测试模式（不写终端，输出每个虫子占据位置的字符）
   obugs --help     显示此帮助信息
 
 工作流程:
   obugs --on          # 包装当前终端，立即开始嗅探
   # 正常使用终端      # 有 error 时虫子飘出
   obugs --off         # 从另一个终端执行，停止
+
+测试模式:
+  obugs --test        # 启动测试模式
+  # 正常使用终端      # 每有输出时，stderr 输出 10 组随机位置的字符
+  Ctrl+D 或 obugs --off 退出
 
 配置: ~/.config/obugs/config.toml
 "#);
