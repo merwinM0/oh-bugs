@@ -200,6 +200,11 @@ pub fn run() -> anyhow::Result<()> {
 
     let bug_lifetime = config.bug_lifetime_ms;
 
+    // ── 光标恢复辅助：用 ScreenBuffer 跟踪的位置显式 CUP，不依赖 save/restore ──
+    fn restore_cursor(screen: &ScreenBuffer, dev: &mut impl Write) -> std::io::Result<()> {
+        write!(dev, "\x1b[{};{}H", screen.cursor_y().saturating_add(1), screen.cursor_x().saturating_add(1))
+    }
+
     // ── 输入回显跟踪 ──
     let mut pending_echo: VecDeque<u8> = VecDeque::with_capacity(1024);
 
@@ -259,6 +264,7 @@ pub fn run() -> anyhow::Result<()> {
                                 &screen,
                             );
                             let _ = mgr.draw_to(&mut std::io::stdout(), &mut screen);
+                            let _ = restore_cursor(&screen, &mut std::io::stdout());
                             let _ = std::io::stdout().flush();
                         }
                     }
@@ -282,6 +288,7 @@ pub fn run() -> anyhow::Result<()> {
         {
             let mut mgr = bug_manager.lock().unwrap();
             let _ = mgr.update(&mut std::io::stdout(), &mut screen);
+            let _ = restore_cursor(&screen, &mut std::io::stdout());
             let _ = std::io::stdout().flush();
         }
 
@@ -297,6 +304,7 @@ pub fn run() -> anyhow::Result<()> {
     {
         let mut mgr = bug_manager.lock().unwrap();
         let _ = mgr.clear_all(&mut std::io::stdout(), &mut screen);
+        let _ = restore_cursor(&screen, &mut std::io::stdout());
         let _ = std::io::stdout().flush();
     }
 

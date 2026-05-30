@@ -273,6 +273,16 @@ impl ScreenBuffer {
         }
     }
 
+    /// ScreenBuffer 跟踪的终端光标列（0-indexed）
+    pub fn cursor_x(&self) -> u16 {
+        self.cursor_x
+    }
+
+    /// ScreenBuffer 跟踪的终端光标行（0-indexed）
+    pub fn cursor_y(&self) -> u16 {
+        self.cursor_y
+    }
+
     pub fn cols(&self) -> u16 {
         self.cols
     }
