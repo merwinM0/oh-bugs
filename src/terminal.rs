@@ -79,15 +79,15 @@ impl Terminal {
     }
 
     /// 在指定位置写入 Emoji（写入任意 Write 对象，如终端设备文件）
-    /// 写入前后保存/恢复光标，不改变终端光标位置
+    /// 不包含 save/restore 包裹——调用方负责在批次层面做一次 save/restore。
     pub fn draw_bug_to<W: Write>(w: &mut W, x: u16, y: u16, emoji: &str) -> std::io::Result<()> {
-        write!(w, "\x1b[s\x1b[{};{}H{}\x1b[u", y.saturating_sub(1), x + 1, emoji)
+        write!(w, "\x1b[{};{}H{}", y.saturating_sub(1), x + 1, emoji)
     }
 
     /// 在指定位置写入指定字符（写入任意 Write 对象，用于恢复被虫子覆盖的文字）
-    /// 写入前后保存/恢复光标，不改变终端光标位置
+    /// 不包含 save/restore 包裹——调用方负责在批次层面做一次 save/restore。
     pub fn clear_at_to<W: Write>(w: &mut W, x: u16, y: u16, ch: char) -> std::io::Result<()> {
-        write!(w, "\x1b[s\x1b[{};{}H{}\x1b[u", y.saturating_sub(1), x + 1, ch)
+        write!(w, "\x1b[{};{}H{}", y.saturating_sub(1), x + 1, ch)
     }
 
     /// 在指定位置恢复被虫子覆盖的两个字符（虫子占 2 列宽度）
@@ -101,7 +101,7 @@ impl Terminal {
     ) -> std::io::Result<()> {
         write!(
             w,
-            "\x1b[s\x1b[{};{}H{}\x1b[{};{}H{}\x1b[u",
+            "\x1b[{};{}H{}\x1b[{};{}H{}",
             y.saturating_sub(1),
             x + 1,
             ch_left,

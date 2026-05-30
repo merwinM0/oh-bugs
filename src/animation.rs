@@ -126,12 +126,18 @@ impl BugManager {
     /// 每只虫子（方案 B）：
     ///   1. 死亡 → 从 ScreenBuffer 实时读 (old_x, old_y) → 写回终端，丢弃
     ///   2. 存活 → 同上恢复 → 移动 → 记录 old = 当前位置 → 在当前位置绘制 emoji
+    ///
+    /// 整个批次只做一次 save/restore（\x1b7 / \x1b8），避免逐虫 save/restore
+    /// 累积光标漂移导致触发次数越多错位越严重。
     pub fn update<W: Write>(&mut self, dev: &mut W, screen: &mut ScreenBuffer) -> std::io::Result<()> {
         self.tick = self.tick.wrapping_add(1);
         let now = Instant::now();
         let cols = screen.cols();
         let rows = screen.rows();
         if cols < 2 || rows == 0 { self.bugs.clear(); return Ok(()); }
+
+        // ── 批次级别：保存光标一次 ──
+        dev.write_all(b"\x1b7")?;
 
         let max_x = cols.saturating_sub(2).max(1);
         let safe_rows = rows.saturating_sub(2);
@@ -177,11 +183,18 @@ impl BugManager {
         }
 
         self.bugs = alive;
+
+        // ── 批次级别：恢复光标一次 ──
+        dev.write_all(b"\x1b8")?;
         Ok(())
     }
 
     /// 为刚创建的虫子绘制 emoji。方案 B：不保存任何字符。
+    /// 整个批次只做一次 save/restore。
     pub fn draw_to<W: Write>(&mut self, dev: &mut W, _screen: &mut ScreenBuffer) -> std::io::Result<()> {
+        // ── 批次级别：保存光标一次 ──
+        dev.write_all(b"\x1b7")?;
+
         let mut emoji_buf = [0u8; 4];
         for bug in &self.bugs {
             // 如果 old == current，说明刚创建还未在终端上画过 emoji
@@ -190,14 +203,24 @@ impl BugManager {
                 Terminal::draw_bug_to(dev, bug.x, bug.y, emoji_str)?;
             }
         }
+
+        // ── 批次级别：恢复光标一次 ──
+        dev.write_all(b"\x1b8")?;
         Ok(())
     }
 
     /// 退出时恢复所有虫子的位置
+    /// 整个批次只做一次 save/restore。
     pub fn clear_all<W: Write>(&mut self, dev: &mut W, screen: &mut ScreenBuffer) -> std::io::Result<()> {
+        // ── 批次级别：保存光标一次 ──
+        dev.write_all(b"\x1b7")?;
+
         for bug in self.bugs.drain(..) {
             Self::restore_at(dev, screen, bug.old_x, bug.old_y)?;
         }
+
+        // ── 批次级别：恢复光标一次 ──
+        dev.write_all(b"\x1b8")?;
         Ok(())
     }
 }

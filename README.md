@@ -138,7 +138,7 @@ PTY 输出解析（同前）：
 | 轨迹标识    | 每虫独立 `id` + 随机 `phase`，确保轨迹互不重叠                        |
 | 保存策略    | 触发时 `SavedCell::capture()` 读取 ScreenBuffer 存入虫子自身 `saved_*` |
 | 恢复策略    | 移动/死亡时始终用 `saved_*.character`（触发时刻备份），不读 ScreenBuffer |
-| 光标保护    | 所有终端写入用 `\x1b[s`…`\x1b[u` 包裹，不改变光标位置                |
+| 光标保护    | 逐操作 save/restore 改为**批次级别**单次 save/restore：`draw_to` / `update` / `clear_all` 各自用 `\x1b7`…`\x1b8`（DECSC/DECRC）包裹整批，避免每个虫子每次操作独立 save/restore（3N 次/ tick）累积光标漂移 |
 | 生命周期    | 每只虫子独立随机 2~3 秒（基于配置中心值 ±500ms），到期自动消失并恢复文字 |
 | 最大并发    | 屏幕同时最多显示 30 只虫子                                            |
 | 边缘处理    | 距边缘 <3 列时强制向中心方向走，避免堆积在屏幕边缘                  |
@@ -172,38 +172,40 @@ PTY master read   ──→  [1] 写入真实终端 stdout
                          [4] 送入 Watcher.scan()
                               ↓ 匹配 error
                          [5] BugManager.trigger() 生成虫子
-                              ├─ saved_left  = SavedCell::empty(x, y)
-                              └─ saved_right = SavedCell::empty(x+1, y)
                          [6] BugManager.draw_to() — 初始化新虫子
-                              ├─ saved_left  = SavedCell::capture(screen, x, y)
-                              ├─ saved_right = SavedCell::capture(screen, x+1, y)
-                              └─ Terminal.draw_bug_to() 绘制 Emoji
+                              ├─ \x1b7（DECSC 保存光标）
+                              ├─ 遍历新虫子，逐个 CUP + 绘制 Emoji
+                              └─ \x1b8（DECRC 恢复光标）
 
 动画 tick (每 ~5ms)
    ↓
-BugManager.update()  — 每只虫子原子操作：
-    ├─ 死亡：Terminal.clear_at_to(saved_left.x, saved_left.y, saved_left.character)
-    │        Terminal.clear_at_to(saved_right.x, saved_right.y, saved_right.character)
-    ├─ 存活：
-    │   1. 恢复旧位：Terminal.clear_at_to(saved_left.x, saved_left.y, saved_left.character)
-    │                 Terminal.clear_at_to(saved_right.x, saved_right.y, saved_right.character)
-    │   2. 随机移动（更新 x, y）
-    │   3. 保存新位：saved_left  = SavedCell::capture(screen, x, y)
-    │                 saved_right = SavedCell::capture(screen, x+1, y)
-    │   4. 绘制 Emoji
+BugManager.update()
+   ├─ \x1b7（DECSC 保存光标）—— 整批只存一次
+   ├─ 遍历每只虫子：
+   │   死亡：从 ScreenBuffer 实时读字符 → CUP + 写回终端
+   │   存活：
+   │     1. CUP + 写回字符（恢复旧位）
+   │     2. 随机移动（更新 x, y）
+   │     3. CUP + 绘制 Emoji（新位）
+   └─ \x1b8（DECRC 恢复光标）—— 整批只恢复一次
 
 退出时
    ↓
 BugManager.clear_all()
-   └─ 遍历所有 bugs
-      └─ Terminal.clear_at_to(saved_left.x, saved_left.y, saved_left.character) × 2
+   ├─ \x1b7（DECSC 保存光标）
+   ├─ 遍历所有 bugs，逐个 CUP + 写回字符
+   └─ \x1b8（DECRC 恢复光标）
 ```
 
 > **核心思路：** 每只虫子 **自己记住自己覆盖了什么内容**（`saved_left` / `saved_right`），
 > 移动时把 saved_* 恢复到旧位置，再保存新位置的内容；
 > 死亡时把 saved_* 恢复到当前位置。
 > ScreenBuffer 只追踪终端字符，不感知虫子，完全解耦。
-> 所有终端写入（画 emoji / 恢复字符）均用 `\x1b[s`…`\x1b[u` 包裹，光标位置不受影响。
+> 
+> **避免累积漂移：** 不采用逐操作 save/restore，而是每批次（`draw_to` / `update` / `clear_all`）
+> 在开头做一次 `\x1b7`（DECSC 保存光标），在结尾做一次 `\x1b8`（DECRC 恢复光标）。
+> 无论批次内有几只虫子，光标始终只存一次、恢复一次，
+> 彻底消除逐虫 save/restore 不可靠导致的多触发累积错位。
 
 ## 6. 技术选型
 
