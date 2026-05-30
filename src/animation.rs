@@ -113,23 +113,25 @@ impl BugManager {
         }
     }
 
-    // ── restore helper: 从 ScreenBuffer 实时读取 (x,y) 和 (x+1,y) 并写回终端 ──
+    // ── restore helper: 从 ScreenBuffer 实时读取 (x,y) 和 (x+1,y)，一次写入两个字符 ──
+    /// 用 clear_bug_at_to 合并写入，避免终端将第 2 列视为"宽字符延续"而丢弃写入。
     fn restore_at<W: Write>(dev: &mut W, screen: &ScreenBuffer, x: u16, y: u16) -> std::io::Result<()> {
         let ch_left = screen.get_char(x, y);
         let ch_right = screen.get_char(x + 1, y);
-        Terminal::clear_at_to(dev, x, y, ch_left)?;
-        Terminal::clear_at_to(dev, x + 1, y, ch_right)
+        Terminal::clear_bug_at_to(dev, x, y, ch_left, ch_right)
     }
 
     /// 每 tick 更新一次
     ///
     /// 每只虫子（方案 B）：
     ///   1. 死亡 → 从 ScreenBuffer 实时读 (old_x, old_y) → 写回终端，丢弃
-    ///   2. 存活 → 同上恢复 → 移动 → 记录 old = 当前位置 → 在当前位置绘制 emoji
+    ///   2. 存活 → 先移动，再恢复旧位置 → 记录 old = 当前位置 → 在新位置绘制 emoji
+    ///
+    /// "先移动再恢复"：保存 old 位 → 计算新位 → 恢复上帧的 old 位（此时旧位置已清空）
+    /// → 绘制新位。这样不同虫子的恢复/绘制区域不会重叠。
     ///
     /// 注意：不在此处做 save/restore。调用方（daemon）负责在批次结束后
-    /// 用 ScreenBuffer 的 cursor 位置显式 CUP 恢复光标，避免与 Shell 提示符
-    /// 中的 DECSC/DECRC（\x1b7/\x1b8）冲突导致累积错位。
+    /// 用 ScreenBuffer 的 cursor 位置显式 CUP 恢复光标。
     pub fn update<W: Write>(&mut self, dev: &mut W, screen: &mut ScreenBuffer) -> std::io::Result<()> {
         self.tick = self.tick.wrapping_add(1);
         let now = Instant::now();
@@ -147,8 +149,9 @@ impl BugManager {
                 // ── 死亡：从 ScreenBuffer 实时读最新字符恢复 ──
                 Self::restore_at(dev, screen, bug.old_x, bug.old_y)?;
             } else {
-                // ── 存活：先恢复 old 位，再移动 ──
-                Self::restore_at(dev, screen, bug.old_x, bug.old_y)?;
+                // ── 存活：保存上帧位置 → 先移动 → 再恢复上帧旧位 → 绘制新位 ──
+                let restore_x = bug.old_x;
+                let restore_y = bug.old_y;
 
                 let mut rng = SimpleRng::new(self.tick.wrapping_mul(6364136223846793005).wrapping_add(bug.phase));
 
@@ -167,6 +170,9 @@ impl BugManager {
                 if new_y <= 0 { bug.y = 1; bug.direction_y = 1; }
                 else if new_y as u16 >= rows { bug.y = safe_rows.max(1); bug.direction_y = -1; }
                 else { bug.y = new_y as u16; }
+
+                // 先恢复上帧旧位置（在移动之后才执行，但坐标是移动前保存的）
+                Self::restore_at(dev, screen, restore_x, restore_y)?;
 
                 // 记录当前位置为下一帧的 old 位
                 bug.old_x = bug.x;
