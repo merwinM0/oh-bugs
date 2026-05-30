@@ -179,6 +179,20 @@ impl ScreenBuffer {
                 }
                 None
             }
+            b']' => {
+                // OSC: \x1b]...\x07 或 \x1b]...\x1b\\，跳过到终止符
+                let mut i = 2;
+                while i < data.len() {
+                    if data[i] == 0x07 {
+                        return Some(i + 1);
+                    }
+                    if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'\\' {
+                        return Some(i + 2);
+                    }
+                    i += 1;
+                }
+                None
+            }
             _ if data.len() >= 2 => Some(2),
             _ => None,
         }

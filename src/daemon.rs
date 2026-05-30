@@ -34,11 +34,11 @@ pub fn request_shutdown() {
 }
 
 /// 运行测试模式（前台阻塞）
-///
-/// 只包装 PTY，不触发虫子。
-/// 有 PTY 输出时，输出 10 组随机位置的 ScreenBuffer 字符到 stderr。
 pub fn run_test() -> anyhow::Result<()> {
     let _term = Terminal::enter()?;
+    // 切换到备用屏，保存用户原有终端内容
+    write!(std::io::stdout(), "\x1b[?1049h")?;
+    std::io::stdout().flush()?;
 
     let (cols, rows) = Terminal::size().unwrap_or((80, 24));
     let mut screen = ScreenBuffer::new(cols, rows);
@@ -143,6 +143,9 @@ pub fn run_test() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    // 退出时恢复主屏
+    write!(std::io::stdout(), "\x1b[?1049l")?;
+    std::io::stdout().flush()?;
     Ok(())
 }
 
@@ -152,6 +155,9 @@ pub fn run() -> anyhow::Result<()> {
 
     // ── 进入 raw mode ──
     let _term = Terminal::enter()?;
+    // 切换到备用屏，保存用户原有终端内容
+    write!(std::io::stdout(), "\x1b[?1049h")?;
+    std::io::stdout().flush()?;
 
     // ── 获取终端尺寸 ──
     let (cols, rows) = Terminal::size().unwrap_or((80, 24));
@@ -294,14 +300,30 @@ pub fn run() -> anyhow::Result<()> {
         let _ = std::io::stdout().flush();
     }
 
+    // 恢复主屏（用户原有终端内容完好无损）
+    write!(std::io::stdout(), "\x1b[?1049l")?;
+    std::io::stdout().flush()?;
+
     Ok(())
 }
 
 fn strip_echo<'a>(data: &'a [u8], pending: &mut VecDeque<u8>) -> (&'a [u8], usize) {
     let mut consumed = 0usize;
-    for &b in data {
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
         match pending.front() {
-            Some(&pe) if pe == b => { pending.pop_front(); consumed += 1; }
+            Some(&pe) if pe == b => {
+                pending.pop_front();
+                consumed += 1;
+                i += 1;
+            }
+            // 终端将 \n 回显为 \r\n：data 中的 \r 匹配 pending 中的 \n
+            Some(&pe) if pe == b'\n' && b == b'\r' => {
+                // 消耗 \r，不消耗 pending 中的 \n（留给后面的 \n 匹配）
+                consumed += 1;
+                i += 1;
+            }
             _ => break,
         }
     }

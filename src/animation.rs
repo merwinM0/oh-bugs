@@ -1,11 +1,15 @@
 //! 虫子动画引擎 — 屏幕覆盖模式
 //!
-//! 每只虫子通过 `saved_left` / `saved_right` **自己记住自己覆盖了什么内容**。
+//! ## 方案 B（当前实现）
 //!
-//! 移动时：把 saved_* 恢复到旧位置 → 移动 → 保存新位置的内容到 saved_*
-//! 死亡时：把 saved_* 恢复到当前位置
+//! 虫子不保存原始字符。移动/死亡时直接从 ScreenBuffer 实时读取最新字符来恢复：
 //!
-//! ScreenBuffer 只提供纯文本追踪，不感知虫子。
+//! 1. 虫子出现在 (x, y)：直接绘制 emoji（ScreenBuffer 不受影响）
+//! 2. 虫子移动：从 ScreenBuffer 读 (old_x, old_y)→写回终端 → 更新 old_x/y → 在新位置绘制 emoji
+//! 3. 虫子死亡：从 ScreenBuffer 读 (old_x, old_y)→写回终端
+//!
+//! 无论 PTY 输出在虫子存活期间如何变化，ScreenBuffer 始终追踪最新内容，
+//! 虫子恢复时永远拿到的是最新字符，不会写回过时数据。
 
 use crate::screen::ScreenBuffer;
 use crate::terminal::Terminal;
@@ -14,7 +18,6 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-/// 虫子 Emoji 池（🦟🪰🐝🕷️🦗 在大多数终端中占 2 列宽度）
 const BUG_EMOJIS: &[(&str, char)] = &[
     ("🦟", '🦟'),
     ("🪰", '🪰'),
@@ -23,42 +26,25 @@ const BUG_EMOJIS: &[(&str, char)] = &[
     ("🦗", '🦗'),
 ];
 
-/// 被虫子覆盖的单元格信息
-#[derive(Debug, Clone, Copy)]
-pub struct SavedCell {
-    pub character: char,
-    pub x: u16,
-    pub y: u16,
-}
-
-impl SavedCell {
-    fn empty(x: u16, y: u16) -> Self {
-        Self { character: '\0', x, y }
-    }
-
-    fn capture(screen: &ScreenBuffer, x: u16, y: u16) -> Self {
-        Self { character: screen.get_char(x, y), x, y }
-    }
-}
-
-/// 单只虫子
+/// 单只虫子 — 不保存原始字符，始终从 ScreenBuffer 实时读取
 #[derive(Debug, Clone)]
 pub struct Bug {
     #[allow(dead_code)]
     pub id: u64,
+    /// 当前位置
     pub x: u16,
     pub y: u16,
+    /// 上一帧位置（用于恢复）
+    pub old_x: u16,
+    pub old_y: u16,
     pub emoji: char,
     pub birth: Instant,
     pub direction_x: i8,
     pub direction_y: i8,
     pub phase: u64,
-    pub saved_left: SavedCell,
-    pub saved_right: SavedCell,
     pub lifetime: Duration,
 }
 
-/// 虫子管理器
 pub struct BugManager {
     bugs: Vec<Bug>,
     max_concurrent: usize,
@@ -121,15 +107,28 @@ impl BugManager {
             let phase = rng.next();
 
             self.bugs.push(Bug {
-                id, x, y, emoji: emoji_char, birth: Instant::now(),
+                id, x, y,
+                old_x: x, old_y: y,
+                emoji: emoji_char, birth: Instant::now(),
                 direction_x, direction_y, phase,
-                saved_left: SavedCell::empty(x, y),
-                saved_right: SavedCell::empty(x + 1, y),
                 lifetime: Duration::from_millis(ms.max(500)),
             });
         }
     }
 
+    // ── restore helper: 从 ScreenBuffer 实时读取 (x,y) 和 (x+1,y) 并写回终端 ──
+    fn restore_at<W: Write>(dev: &mut W, screen: &ScreenBuffer, x: u16, y: u16) -> std::io::Result<()> {
+        let ch_left = screen.get_char(x, y);
+        let ch_right = screen.get_char(x + 1, y);
+        Terminal::clear_at_to(dev, x, y, ch_left)?;
+        Terminal::clear_at_to(dev, x + 1, y, ch_right)
+    }
+
+    /// 每 tick 更新一次
+    ///
+    /// 每只虫子（方案 B）：
+    ///   1. 死亡 → 从 ScreenBuffer 实时读 (old_x, old_y) → 写回终端，丢弃
+    ///   2. 存活 → 同上恢复 → 移动 → 记录 old = 当前位置 → 在当前位置绘制 emoji
     pub fn update<W: Write>(&mut self, dev: &mut W, screen: &mut ScreenBuffer) -> std::io::Result<()> {
         self.tick = self.tick.wrapping_add(1);
         let now = Instant::now();
@@ -144,15 +143,11 @@ impl BugManager {
 
         for mut bug in self.bugs.drain(..) {
             if now.duration_since(bug.birth) >= bug.lifetime {
-                if bug.saved_left.character != '\0' {
-                    Terminal::clear_at_to(dev, bug.saved_left.x, bug.saved_left.y, bug.saved_left.character)?;
-                    Terminal::clear_at_to(dev, bug.saved_right.x, bug.saved_right.y, bug.saved_right.character)?;
-                }
+                // ── 死亡：从 ScreenBuffer 实时读最新字符恢复 ──
+                Self::restore_at(dev, screen, bug.old_x, bug.old_y)?;
             } else {
-                if bug.saved_left.character != '\0' {
-                    Terminal::clear_at_to(dev, bug.saved_left.x, bug.saved_left.y, bug.saved_left.character)?;
-                    Terminal::clear_at_to(dev, bug.saved_right.x, bug.saved_right.y, bug.saved_right.character)?;
-                }
+                // ── 存活：先恢复 old 位，再移动 ──
+                Self::restore_at(dev, screen, bug.old_x, bug.old_y)?;
 
                 let mut rng = SimpleRng::new(self.tick.wrapping_mul(6364136223846793005).wrapping_add(bug.phase));
 
@@ -172,23 +167,28 @@ impl BugManager {
                 else if new_y as u16 >= rows { bug.y = safe_rows.max(1); bug.direction_y = -1; }
                 else { bug.y = new_y as u16; }
 
-                bug.saved_left = SavedCell::capture(screen, bug.x, bug.y);
-                bug.saved_right = SavedCell::capture(screen, bug.x + 1, bug.y);
+                // 记录当前位置为下一帧的 old 位
+                bug.old_x = bug.x;
+                bug.old_y = bug.y;
+
+                // 在新位置绘制 emoji
                 let emoji_str = bug.emoji.encode_utf8(&mut emoji_buf);
                 Terminal::draw_bug_to(dev, bug.x, bug.y, emoji_str)?;
+
                 alive.push(bug);
             }
         }
+
         self.bugs = alive;
         Ok(())
     }
 
-    pub fn draw_to<W: Write>(&mut self, dev: &mut W, screen: &mut ScreenBuffer) -> std::io::Result<()> {
-        for bug in &mut self.bugs {
-            if bug.saved_left.character == '\0' {
-                bug.saved_left = SavedCell::capture(screen, bug.x, bug.y);
-                bug.saved_right = SavedCell::capture(screen, bug.x + 1, bug.y);
-                let mut emoji_buf = [0u8; 4];
+    /// 为刚创建的虫子绘制 emoji。方案 B：不保存任何字符。
+    pub fn draw_to<W: Write>(&mut self, dev: &mut W, _screen: &mut ScreenBuffer) -> std::io::Result<()> {
+        let mut emoji_buf = [0u8; 4];
+        for bug in &self.bugs {
+            // 如果 old == current，说明刚创建还未在终端上画过 emoji
+            if bug.old_x == bug.x && bug.old_y == bug.y {
                 let emoji_str = bug.emoji.encode_utf8(&mut emoji_buf);
                 Terminal::draw_bug_to(dev, bug.x, bug.y, emoji_str)?;
             }
@@ -196,12 +196,10 @@ impl BugManager {
         Ok(())
     }
 
-    pub fn clear_all<W: Write>(&mut self, dev: &mut W, _screen: &mut ScreenBuffer) -> std::io::Result<()> {
+    /// 退出时恢复所有虫子的位置
+    pub fn clear_all<W: Write>(&mut self, dev: &mut W, screen: &mut ScreenBuffer) -> std::io::Result<()> {
         for bug in self.bugs.drain(..) {
-            if bug.saved_left.character != '\0' {
-                Terminal::clear_at_to(dev, bug.saved_left.x, bug.saved_left.y, bug.saved_left.character)?;
-                Terminal::clear_at_to(dev, bug.saved_right.x, bug.saved_right.y, bug.saved_right.character)?;
-            }
+            Self::restore_at(dev, screen, bug.old_x, bug.old_y)?;
         }
         Ok(())
     }
