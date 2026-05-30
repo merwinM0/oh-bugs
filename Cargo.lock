@@ -191,7 +191,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "oh-bugs"
+name = "obugs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
