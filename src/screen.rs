@@ -1,27 +1,50 @@
 //! 屏幕缓冲区（Screen Buffer）
 //!
-//! 实时追踪终端屏幕上的字符内容，支持虫子动画的"保存→覆盖→恢复"流程。
-//!
 //! 使用 `rows × cols` 的二维 Cell 网格统一记录终端文本与虫子覆盖信息。
+//! 每个 Cell 包含：
+//!   - original_char：终端在该位置的原始字符
+//!   - current_char：当前显示的字符（被虫子覆盖时不同）
+//!   - bug_id：占用此格子的虫子 ID（None = 无虫子）
+//!   - attributes：颜色、样式等视觉属性
+//!
 //! 虫子 Emoji（🦟🪰🐝🕷️🦗）在大多数终端中占 2 列宽度，
-//! 因此保存/恢复操作同时处理 (x, y) 和 (x+1, y) 两个单元格。
+//! 因此虫子 API 同时操作 (x, y) 和 (x+1, y) 两个单元格。
 
-use std::collections::HashMap;
+/// 单元格视觉属性（颜色、样式等）
+///
+/// 目前 PTY 输出解析尚未填充这些字段，保留为后续 SGR 解析预留。
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct CellAttributes {
+    /// 粗体
+    pub bold: bool,
+    /// 前景色（ANSI 色号，None = 默认）
+    pub fg_color: Option<u8>,
+    /// 背景色（ANSI 色号，None = 默认）
+    pub bg_color: Option<u8>,
+}
 
-/// 屏幕上的一个单元格：记录终端字符与虫子覆盖状态
+/// 屏幕上的一个单元格：记录终端字符、虫子占用与视觉属性
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Cell {
-    /// 终端输出的原始字符
-    pub ch: char,
-    /// 当前是否有虫子覆盖此单元格
-    pub bug_covered: bool,
+    /// 终端输出的原始字符（始终由 PTY 输出更新）
+    pub original_char: char,
+    /// 当前显示的字符（被虫子覆盖时设为虫子的首字符）
+    pub current_char: char,
+    /// 占用此格子的虫子 ID（None = 未被虫子占用）
+    pub bug_id: Option<u64>,
+    /// 视觉属性（颜色、样式等）
+    pub attributes: CellAttributes,
 }
 
 impl Cell {
-    pub fn new(ch: char) -> Self {
+    fn new(ch: char) -> Self {
         Self {
-            ch,
-            bug_covered: false,
+            original_char: ch,
+            current_char: ch,
+            bug_id: None,
+            attributes: CellAttributes::default(),
         }
     }
 }
@@ -36,8 +59,6 @@ pub struct ScreenBuffer {
     /// 终端尺寸
     cols: u16,
     rows: u16,
-    /// 被虫子覆盖前保存的原始字符: (x, y) → original_char
-    saved: HashMap<(u16, u16), char>,
 }
 
 impl ScreenBuffer {
@@ -49,7 +70,6 @@ impl ScreenBuffer {
             cursor_y: 0,
             cols,
             rows,
-            saved: HashMap::new(),
         }
     }
 
@@ -69,9 +89,6 @@ impl ScreenBuffer {
         self.rows = rows;
         self.cursor_x = self.cursor_x.min(cols.saturating_sub(1));
         self.cursor_y = self.cursor_y.min(rows.saturating_sub(1));
-
-        // 清理超出边界的 saved 项
-        self.saved.retain(|&(x, y), _| x < cols && y < rows);
     }
 
     /// 处理从 PTY 输出的数据，更新屏幕缓冲区
@@ -138,12 +155,18 @@ impl ScreenBuffer {
         }
     }
 
-    /// 在光标位置放置一个字符（只更新 `ch`，不改变 `bug_covered`）
+    /// 在光标位置放置一个字符：
+    /// - 始终更新 `original_char`
+    /// - 仅在无虫子占用时更新 `current_char`
     fn put_char(&mut self, ch: char) {
         if self.cursor_x < self.cols && self.cursor_y < self.rows {
             let row = self.cursor_y as usize;
             let col = self.cursor_x as usize;
-            self.cells[row][col].ch = ch;
+            let cell = &mut self.cells[row][col];
+            cell.original_char = ch;
+            if cell.bug_id.is_none() {
+                cell.current_char = ch;
+            }
         }
         self.cursor_x += 1;
         if self.cursor_x >= self.cols {
@@ -158,17 +181,6 @@ impl ScreenBuffer {
 
     /// 屏幕上滚一行（所有内容上移，底部插入空行）
     fn scroll_up(&mut self) {
-        // 上移 saved 键中的 y 坐标
-        let mut new_saved = HashMap::new();
-        for (&(x, y), &ch) in &self.saved {
-            if y == 0 {
-                continue;
-            }
-            new_saved.insert((x, y - 1), ch);
-        }
-        self.saved = new_saved;
-
-        // 上移单元格网格
         for r in 1..self.rows as usize {
             self.cells[r - 1] = std::mem::replace(
                 &mut self.cells[r],
@@ -272,7 +284,10 @@ impl ScreenBuffer {
                     2 => {
                         for row in &mut self.cells {
                             for cell in row.iter_mut() {
-                                cell.ch = ' ';
+                                cell.original_char = ' ';
+                                if cell.bug_id.is_none() {
+                                    cell.current_char = ' ';
+                                }
                             }
                         }
                     }
@@ -304,7 +319,7 @@ impl ScreenBuffer {
         }
     }
 
-    /// 清除矩形区域（将 `ch` 设为空格，不改变 `bug_covered`）
+    /// 清除矩形区域（original_char 设为空格，无虫子时 current_char 同步更新）
     fn clear_region(&mut self, x1: u16, y1: u16, x2: u16, y2: u16) {
         for r in y1..=y2 {
             if r >= self.rows {
@@ -314,81 +329,84 @@ impl ScreenBuffer {
                 if c >= self.cols {
                     break;
                 }
-                self.cells[r as usize][c as usize].ch = ' ';
+                let cell = &mut self.cells[r as usize][c as usize];
+                cell.original_char = ' ';
+                if cell.bug_id.is_none() {
+                    cell.current_char = ' ';
+                }
             }
         }
     }
 
     // ─── Bug 2-Column Width API ───
     //
-    // 虫子 Emoji（🦟🪰🐝🕷️🦗）在大多数终端中占 2 列宽度，
-    // 因此每只虫子覆盖 (x, y) 和 (x+1, y) 两个单元格。
+    // 虫子 Emoji（🦟🪰🐝🕷️🦗）在大多数终端中占 2 列宽度。
+    // save_bug 在 (x, y) 和 (x+1, y) 记录虫子 ID；
+    // restore_bug 清除标记、恢复 current_char，返回原始字符供终端重绘。
 
-    /// 保存虫子覆盖位置 (x, y) 和 (x+1, y) 的原始字符，
-    /// 并将两个单元格标记为 `bug_covered`。
+    /// 标记虫子占用的两个单元格 (x, y) 和 (x+1, y)。
     ///
-    /// 返回 `[left_original, right_original]`。
-    pub fn save_bug(&mut self, x: u16, y: u16) -> [char; 2] {
-        let left = self.save_cell(x, y);
-        let right = self.save_cell(x + 1, y);
+    /// - 左单元格 `current_char` 设为虫子的首字符
+    /// - 右单元格 `current_char` 设为 `'\0'`（占位标记）
+    /// - 两个单元格的 `bug_id` 均设为 `Some(id)`
+    pub fn save_bug(&mut self, x: u16, y: u16, bug_id: u64, emoji: &str) {
+        let emoji_first = emoji.chars().next().unwrap_or(' ');
         if y < self.rows {
             if x < self.cols {
-                self.cells[y as usize][x as usize].bug_covered = true;
+                let cell = &mut self.cells[y as usize][x as usize];
+                cell.current_char = emoji_first;
+                cell.bug_id = Some(bug_id);
             }
             if x + 1 < self.cols {
-                self.cells[y as usize][x as usize + 1].bug_covered = true;
+                let cell = &mut self.cells[y as usize][x as usize + 1];
+                cell.current_char = '\0';
+                cell.bug_id = Some(bug_id);
             }
         }
-        [left, right]
     }
 
-    /// 恢复虫子覆盖位置 (x, y) 和 (x+1, y) 的原始字符，
-    /// 并取消两个单元格的 `bug_covered` 标记。
+    /// 恢复虫子占用的两个单元格 (x, y) 和 (x+1, y)。
     ///
-    /// 返回 `[Some(left), Some(right)]`，若未被保存则为 `None`。
-    pub fn restore_bug(&mut self, x: u16, y: u16) -> [Option<char>; 2] {
-        let left = self.restore_cell(x, y);
-        let right = self.restore_cell(x + 1, y);
+    /// 清除 `bug_id`、恢复 `current_char = original_char`。
+    /// 返回 `[left_original, right_original]` 供终端重绘。
+    pub fn restore_bug(&mut self, x: u16, y: u16, bug_id: u64) -> [char; 2] {
+        let mut chars = [' ', ' '];
         if y < self.rows {
             if x < self.cols {
-                self.cells[y as usize][x as usize].bug_covered = false;
+                let cell = &mut self.cells[y as usize][x as usize];
+                if cell.bug_id == Some(bug_id) {
+                    chars[0] = cell.original_char;
+                    cell.current_char = cell.original_char;
+                    cell.bug_id = None;
+                }
             }
             if x + 1 < self.cols {
-                self.cells[y as usize][x as usize + 1].bug_covered = false;
+                let cell = &mut self.cells[y as usize][x as usize + 1];
+                if cell.bug_id == Some(bug_id) {
+                    chars[1] = cell.original_char;
+                    cell.current_char = cell.original_char;
+                    cell.bug_id = None;
+                }
             }
         }
-        [left, right]
+        chars
     }
 
-    /// 检查某位置是否被虫子覆盖
-    pub fn is_bug_covered(&self, x: u16, y: u16) -> bool {
+    /// 获取某位置的当前显示字符
+    #[allow(dead_code)]
+    pub fn get_char(&self, x: u16, y: u16) -> char {
         if x < self.cols && y < self.rows {
-            self.cells[y as usize][x as usize].bug_covered
-        } else {
-            false
-        }
-    }
-
-    /// 保存单个单元格的原始字符（内部使用，返回该位置的字符）
-    fn save_cell(&mut self, x: u16, y: u16) -> char {
-        if x < self.cols && y < self.rows {
-            let ch = self.cells[y as usize][x as usize].ch;
-            self.saved.entry((x, y)).or_insert(ch);
-            ch
+            self.cells[y as usize][x as usize].current_char
         } else {
             ' '
         }
     }
 
-    /// 恢复单个单元格的原始字符（内部使用）
-    fn restore_cell(&mut self, x: u16, y: u16) -> Option<char> {
-        self.saved.remove(&(x, y))
-    }
-
-    /// 获取某位置的当前字符
-    pub fn get_char(&self, x: u16, y: u16) -> char {
+    /// 获取某位置的原始字符
+    #[allow(dead_code)]
+    pub fn get_original_char(&self, x: u16, y: u16) -> char {
         if x < self.cols && y < self.rows {
-            self.cells[y as usize][x as usize].ch
+            self.cells[y as usize][x as usize].original_char
         } else {
             ' '
         }

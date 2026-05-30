@@ -90,6 +90,7 @@ impl Terminal {
     }
 
     /// 在指定位置恢复被虫子覆盖的两个字符（虫子占 2 列宽度）
+    #[allow(dead_code)]
     pub fn clear_bug_at_to<W: Write>(
         w: &mut W,
         x: u16,
@@ -109,11 +110,6 @@ impl Terminal {
         )
     }
 
-    /// 在指定位置绘制虫子 Emoji（虫子占 2 列宽度，直接写入 emoji 即可）
-    /// 与 draw_bug_to 功能相同，为语义清晰提供的别名
-    pub fn draw_bug_at_to<W: Write>(w: &mut W, x: u16, y: u16, emoji: &str) -> std::io::Result<()> {
-        write!(w, "\x1b[{};{}H{}", y + 1, x + 1, emoji)
-    }
 }
 
 impl Drop for Terminal {
