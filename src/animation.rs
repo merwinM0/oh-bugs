@@ -10,6 +10,7 @@
 use crate::screen::ScreenBuffer;
 use crate::terminal::Terminal;
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -137,9 +138,33 @@ impl BugManager {
         let half = 500u64.min(base_ms);
         let max_x = cols.saturating_sub(2).max(1);
 
+        // 收集已有虫子占用的位置，避免新虫子与已有虫子重叠
+        let mut occupied: HashSet<(u16, u16)> = HashSet::new();
+        for bug in &self.bugs {
+            occupied.insert((bug.x, bug.y));
+            occupied.insert((bug.x + 1, bug.y));
+        }
+
         for _ in 0..to_spawn {
-            let y = (rng.next() % (rows / 2).max(1) as u64) as u16;
-            let x = (rng.next() % max_x as u64) as u16;
+            // 最多尝试 100 次找不重叠的位置
+            let mut y: u16;
+            let mut x: u16;
+            {
+                let mut attempt = 0u32;
+                loop {
+                    y = (rng.next() % (rows / 2).max(1) as u64) as u16;
+                    x = (rng.next() % max_x as u64) as u16;
+                    if !occupied.contains(&(x, y)) && !occupied.contains(&(x + 1, y)) {
+                        break;
+                    }
+                    attempt += 1;
+                    if attempt >= 100 {
+                        break;
+                    }
+                }
+            }
+            occupied.insert((x, y));
+            occupied.insert((x + 1, y));
             let (_, emoji_char) = BUG_EMOJIS[rng.next() as usize % BUG_EMOJIS.len()];
             let id = self.next_id;
             self.next_id += 1;
