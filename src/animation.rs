@@ -71,11 +71,8 @@ impl BugManager {
         let mut rng = SimpleRng::new(seed);
         self.tick = self.tick.wrapping_add(1);
 
-        let mut to_spawn = 0;
-        for _ in 0..match_count {
-            to_spawn += 2 + (rng.next() % 4) as usize;
-        }
-        let to_spawn = to_spawn.min(available);
+        // 固定生成 8 只虫子，不从 error 次数累加
+        let to_spawn = 8usize.min(available);
         let base_ms = lifetime.as_millis() as u64;
         let half = 500u64.min(base_ms);
         let max_x = cols.saturating_sub(2).max(1);
