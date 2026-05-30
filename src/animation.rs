@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 /// 虫子 Emoji 池
 const BUG_EMOJIS: &[&str] = &["🦟", "🪰", "🐝", "🕷️", "🦗"];
 
-/// 单只虫子
+/// 虫子 Emoji 🦟🪰🐝🕷️🦗 在大多数终端中占 2 列宽度。
+/// 每只虫子覆盖 (x, y) 和 (x+1, y) 两个单元格。
 #[derive(Debug, Clone)]
 pub struct Bug {
     pub x: u16,
@@ -30,10 +31,10 @@ pub struct Bug {
     pub birth: Instant,
     pub direction: i8, // -1: 向左, 1: 向右
     pub lifetime: Duration,
-    /// 虫子在当前位置覆盖的原始字符（用于恢复）
-    /// 有值 = 虫子正覆盖在该位置，移动/消失前需恢复
-    /// None   = 虫子还未保存位置（刚创建），或已恢复
-    pub saved_char: Option<char>,
+    /// 虫子在当前位置覆盖的两个原始字符 `[left, right]`（对应 x, x+1）
+    /// Some = 虫子正覆盖在该位置，移动/消失前需恢复
+    /// None = 虫子还未保存位置（刚创建），或已恢复
+    pub saved_chars: Option<[char; 2]>,
     /// 随机相位，用于每只虫子独立的伪随机序列
     pub phase: u64,
 }
@@ -57,7 +58,8 @@ impl BugManager {
     /// 触发一波虫子（根据匹配次数）
     ///
     /// 每只虫子获得随机生命周期: [lifetime - 500ms, lifetime + 500ms]，至少 500ms
-    /// 刚创建的虫子 `saved_char = None`，由首次 `draw_to` 或下次 `update` 完成保存+绘制
+    /// 刚创建的虫子 `saved_chars = None`，由首次 `draw_to` 或下次 `update` 完成保存+绘制。
+    /// 虫子占 2 列宽度，生成位置 x 被限制在 [0, cols-2]。
     pub fn trigger(&mut self, match_count: usize, lifetime: Duration, screen: &ScreenBuffer) {
         if match_count == 0 {
             return;
@@ -68,7 +70,7 @@ impl BugManager {
         }
         let cols = screen.cols();
         let rows = screen.rows();
-        if cols == 0 || rows == 0 {
+        if cols < 2 || rows == 0 {
             return;
         }
 
@@ -91,9 +93,12 @@ impl BugManager {
         let base_ms = lifetime.as_millis() as u64;
         let half = 500u64.min(base_ms);
 
+        // 虫子占 2 列，最大 x = cols - 2
+        let max_x = cols.saturating_sub(2).max(1);
+
         for _ in 0..to_spawn {
             let y = (rng.next() % (rows / 2).max(1) as u64) as u16;
-            let x = (rng.next() % cols.max(1) as u64) as u16;
+            let x = (rng.next() % max_x as u64) as u16;
             let emoji_idx = (rng.next() % BUG_EMOJIS.len() as u64) as usize;
             let direction = if rng.next() % 2 == 0 { 1 } else { -1 };
 
@@ -111,7 +116,7 @@ impl BugManager {
                 birth: Instant::now(),
                 direction,
                 lifetime: bug_lifetime,
-                saved_char: None,
+                saved_chars: None,
                 phase,
             });
         }
@@ -133,12 +138,13 @@ impl BugManager {
         let now = Instant::now();
         let cols = screen.cols();
         let rows = screen.rows();
-        if cols == 0 || rows == 0 {
+        if cols < 2 || rows == 0 {
             self.bugs.clear();
             return Ok(());
         }
 
-        let safe_cols = cols.saturating_sub(2);
+        // 虫子占 2 列，最大 x = cols - 2，留 1 列上/下边距
+        let max_x = cols.saturating_sub(2).max(1);
         let safe_rows = rows.saturating_sub(2);
 
         let mut alive = Vec::with_capacity(self.bugs.len());
@@ -147,19 +153,21 @@ impl BugManager {
             let elapsed = now.duration_since(bug.birth);
 
             if elapsed >= bug.lifetime {
-                // ── 虫子超时：恢复旧位置的原始字符 ──
-                if let Some(ch) = bug.saved_char.take() {
-                    Terminal::clear_at_to(dev, bug.x, bug.y, ch)?;
-                    screen.restore_char(bug.x, bug.y);
+                // ── 虫子超时：恢复 (x, y) 和 (x+1, y) 的原始字符 ──
+                if let Some([ch_left, ch_right]) = bug.saved_chars.take() {
+                    Terminal::clear_at_to(dev, bug.x, bug.y, ch_left)?;
+                    Terminal::clear_at_to(dev, bug.x + 1, bug.y, ch_right)?;
+                    screen.restore_bug(bug.x, bug.y);
                 }
                 // 丢弃
             } else {
                 // ── 虫子还活着 ──
 
-                // 1) 恢复旧位置的原始字符（飞走 → 文字还原）
-                if let Some(ch) = bug.saved_char.take() {
-                    Terminal::clear_at_to(dev, bug.x, bug.y, ch)?;
-                    screen.restore_char(bug.x, bug.y);
+                // 1) 恢复旧位置两个单元格的原始字符（飞走 → 文字还原）
+                if let Some([ch_left, ch_right]) = bug.saved_chars.take() {
+                    Terminal::clear_at_to(dev, bug.x, bug.y, ch_left)?;
+                    Terminal::clear_at_to(dev, bug.x + 1, bug.y, ch_right)?;
+                    screen.restore_bug(bug.x, bug.y);
                 }
 
                 // 2) 随机移动
@@ -170,10 +178,11 @@ impl BugManager {
                 );
 
                 // ── 水平移动（边缘排斥 + 随机游走） ──
+                // 虫子占 2 列，所以 x 不能超过 max_x
                 let dx = if bug.x < 3 && bug.direction == -1 {
                     bug.direction = 1;
                     1
-                } else if bug.x >= safe_cols && bug.direction == 1 {
+                } else if bug.x >= max_x && bug.direction == 1 {
                     bug.direction = -1;
                     -1
                 } else {
@@ -188,8 +197,8 @@ impl BugManager {
                 if new_x <= 0 {
                     bug.x = 1;
                     bug.direction = 1;
-                } else if new_x as u16 >= cols {
-                    bug.x = safe_cols.max(1);
+                } else if new_x as u16 >= max_x {
+                    bug.x = max_x;
                     bug.direction = -1;
                 } else {
                     bug.x = new_x as u16;
@@ -213,11 +222,11 @@ impl BugManager {
                     bug.y = new_y as u16;
                 }
 
-                // 3) 保存新位置的原始字符（准备覆盖）
-                let ch = screen.save_char(bug.x, bug.y);
-                bug.saved_char = Some(ch);
+                // 3) 保存新位置两个单元格的原始字符（准备覆盖）
+                let chars = screen.save_bug(bug.x, bug.y);
+                bug.saved_chars = Some(chars);
 
-                // 4) 在新位置绘制 Emoji
+                // 4) 在新位置绘制 Emoji（终端自动处理 2 列宽度）
                 Terminal::draw_bug_to(dev, bug.x, bug.y, bug.emoji)?;
 
                 alive.push(bug);
@@ -228,9 +237,10 @@ impl BugManager {
         Ok(())
     }
 
-    /// 为刚创建的虫子（saved_char = None）保存字符并绘制 Emoji
+    /// 为刚创建的虫子（saved_chars = None）保存两个单元格并绘制 Emoji
     ///
-    /// 仅对 trigger 后未保存过的新虫子执行，已有 saved_char 的跳过。
+    /// 仅对 trigger 后未保存过的新虫子执行，已有 saved_chars 的跳过。
+    /// 虫子占 2 列宽度，保存 (x, y) 和 (x+1, y) 两个位置。
     /// 通常在 `trigger` 之后立即调用。
     pub fn draw_to<W: Write>(
         &mut self,
@@ -238,9 +248,9 @@ impl BugManager {
         screen: &mut ScreenBuffer,
     ) -> std::io::Result<()> {
         for bug in &mut self.bugs {
-            if bug.saved_char.is_none() {
-                let ch = screen.save_char(bug.x, bug.y);
-                bug.saved_char = Some(ch);
+            if bug.saved_chars.is_none() {
+                let chars = screen.save_bug(bug.x, bug.y);
+                bug.saved_chars = Some(chars);
                 Terminal::draw_bug_to(dev, bug.x, bug.y, bug.emoji)?;
             }
         }
@@ -248,15 +258,17 @@ impl BugManager {
     }
 
     /// 恢复所有虫子的原始字符（退出时调用）
+    /// 每只虫子恢复 (x, y) 和 (x+1, y) 两个单元格。
     pub fn clear_all<W: Write>(
         &mut self,
         dev: &mut W,
         screen: &mut ScreenBuffer,
     ) -> std::io::Result<()> {
         for bug in self.bugs.drain(..) {
-            if let Some(ch) = bug.saved_char {
-                Terminal::clear_at_to(dev, bug.x, bug.y, ch)?;
-                screen.restore_char(bug.x, bug.y);
+            if let Some([ch_left, ch_right]) = bug.saved_chars {
+                Terminal::clear_at_to(dev, bug.x, bug.y, ch_left)?;
+                Terminal::clear_at_to(dev, bug.x + 1, bug.y, ch_right)?;
+                screen.restore_bug(bug.x, bug.y);
             }
         }
         Ok(())
